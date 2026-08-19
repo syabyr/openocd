@@ -66,7 +66,7 @@ MODE6 dtb（md5 55168378）+ R30 固件：
 
 ### 5. 性能验证 ❌
 
-prupoke 加忙轮询（`exec_cmd_busy`，分支上）后的干净数据：
+prupoke 加忙轮询（`exec_cmd_busy`，已合入主线）后的干净数据：
 
 | 指标 | stock | R30@iters=0 | R30@iters=1 |
 |---|---:|---:|---:|
@@ -113,9 +113,10 @@ clk_low → SWDIO 写发出（OCP，~300ns 后才落到引脚）→ 半相(145ns
 
 分支 `pru-swd-r30` 未提交改动：
 - `firmware/pru-swd.c`：R30 版（头部注释还写着 "mode 5"，若续作改 6）
-- `prupoke.c`：忙轮询计时 + GPCFG 打印（**这两个改动独立有价值**，
-  计时修复尤其值得择机合入主线）
 - linux 树 dts：GPMC_AD12 MODE6
+
+（prupoke 的忙轮询计时 + GPCFG 打印也是本实验产物，测量修复独立
+有价值，已合入主线。）
 
 ## 教训清单
 

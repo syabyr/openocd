@@ -48,6 +48,22 @@ static uint32_t exec_cmd(uint32_t w0, const char *what)
 	exit(1);
 }
 
+/* Timing variant: busy-poll.  The usleep(1000) poll above floors any
+ * measurement at ~1 ms — with an R30-paced clock a 5000-clock command
+ * finishes far below that, so the sleep would completely mask the
+ * number being measured. */
+static uint32_t exec_cmd_busy(uint32_t w0, const char *what)
+{
+	uint32_t c0 = dram[MBOX_COUNTER];
+
+	dram[MBOX_CMD] = w0;
+	for (long i = 0; i < 200000000L; i++)
+		if (dram[MBOX_COUNTER] != c0)
+			return dram[MBOX_RESULT];
+	fprintf(stderr, "PRU did not complete %s (w0=%08x)\n", what, w0);
+	exit(1);
+}
+
 static double now_s(void)
 {
 	struct timespec ts;
@@ -69,14 +85,14 @@ static int timing_mode(int iters, int clocks)
 	double t0 = now_s();
 	for (int i = 0; i < reps; i++) {
 		dram[MBOX_DATA] = clocks;
-		exec_cmd(4, "SIG_IDLE");
+		exec_cmd_busy(4, "SIG_IDLE");
 	}
 	double dt = now_s() - t0;
 
 	/* one read transaction: 2 idle + 8 req + TRN + 3 ack + 32 data
 	 * + parity + TRN = 48 clocks, 36 of them sampling SWDIO */
 	t0 = now_s();
-	exec_cmd(6 | (0xA5u << 8), "READ_REG");
+	exec_cmd_busy(6 | (0xA5u << 8), "READ_REG");
 	double dt_xact = now_s() - t0;
 
 	printf("iters=%d clocks=%d reps=%d\n", iters, clocks, reps);
@@ -140,6 +156,7 @@ int main(int argc, char **argv)
 	}
 	printf("counter after=%u mbox cmd=%08x result0=%08x delay(w20)=%08x\n",
 			dram[18], dram[0], dram[16], dram[20]);
-	printf("final PC=%08x SYSCFG=%08x\n", ctrl[1], *syscfg);
+	printf("final PC=%08x SYSCFG=%08x GPCFG0=%08x GPCFG1=%08x\n",
+			ctrl[1], *syscfg, pru[0x2612c / 4], pru[0x26130 / 4]);
 	return 0;
 }
