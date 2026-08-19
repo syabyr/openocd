@@ -290,21 +290,30 @@ symptom: the first one or two writes succeed, then ack=7 forever.
 
 ## Timing
 
-SWDIO setup/sample happens against the SWCLK rising edge; each half
-phase costs `2 × iterations × 25 ns + ~200 ns` of fixed OCP-register
-overhead (PRU at 200 MHz, ~5 cycles per delay-loop iteration).  The
-driver maps `adapter speed` to iterations as
-`(1000000/kHz − 200) / 50`:
+SWDIO setup/sample happens against the SWCLK rising edge.  Measured on
+a BeagleBone Black: each half phase costs one fixed ~200 ns of OCP
+register access plus ~73 ns per delay-loop iteration (the volatile
+loop body is heavier than the 5 cycles `__delay_cycles(1)` suggests),
+so a full SWCLK period is `2 × (73 × n + 100) ns`.  The driver maps
+`adapter speed` to iterations as
+`(1000000/kHz − 200) / 130`:
 
-| adapter speed | delay iterations |
-|---:|---:|
-| 1000 kHz | 16 |
-| 500 kHz | 36 |
-| 300 kHz | 62 |
-| 100 kHz | 196 |
+| adapter speed | delay iterations | real rate |
+|---:|---:|---:|
+| 2000 kHz | 2 | ~2.0 MHz |
+| 1000 kHz | 6 | ~0.9 MHz |
+| 500 kHz | 13 | ~0.5 MHz |
+| 300 kHz | 24 | ~0.27 MHz |
+| 100 kHz | 75 | ~95 kHz |
 
-1 MHz is the driver's clamp; long flat cables, level shifters or a
+2 MHz is the driver's clamp.  Long flat cables, level shifters or a
 target with weak drive may need 300 kHz or below.
+
+Reference throughput reading 256 KiB of STM32F401 flash
+(`flash read_bank`): ~3.2 s at 2 MHz, ~5.1 s at 1 MHz, ~13.7 s at
+300 kHz.  A 32-bit word costs one SWD transaction (50 clocks with the
+leading idle) plus ~16 µs of host-side mailbox and queue overhead per
+word.
 
 ## Troubleshooting
 

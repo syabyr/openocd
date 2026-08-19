@@ -68,10 +68,22 @@ enum {
  * fixed per-phase overhead of roughly 100 ns for the GPIO OCP writes.
  * khz ~= 1e6 / (iters * 50 + 200)  [ns per clock period]
  */
-#define PRU_DELAY_CYCLES_PER_ITER	5u
+/* Measured on a BeagleBone Black (PRU 200 MHz): one half_phase()
+ * iteration costs ~73 ns (volatile loop + __delay_cycles(1)), and each
+ * clock carries ~200 ns of fixed OCP register-access overhead.  The
+ * original estimate of 25 ns/iter made "adapter speed 1000" run at
+ * ~400 kHz in practice.  13 cycles/iter keeps the real rate at or a
+ * little below the requested rate after integer truncation. */
+#define PRU_DELAY_CYCLES_PER_ITER	13u
 #define PRU_MHZ			200u
 #define PRU_PHASE_FIXED_NS		200u
-#define PRU_MAX_KHZ		1000u
+#define PRU_MAX_KHZ		2000u
+
+/* Busy-poll iterations before pru_swd_exec falls back to usleep(100).
+ * One spin iteration is one uncached mmap read (~150 ns), so this
+ * covers several milliseconds - more than any single transaction even
+ * at 100 kHz. */
+#define PRU_EXEC_SPIN		50000u
 
 /* default firmware location on the target (OpenWrt convention) */
 #define PRU_FW_DEFAULT_PATH	"/lib/firmware/pru-swd.bin"
@@ -102,11 +114,24 @@ static int pru_swd_exec(uint32_t w0, unsigned int timeout_ms)
 	volatile uint32_t *mbox = pru0_dram;
 	uint32_t counter0 = mbox[MBOX_COUNTER];
 	unsigned int polls = timeout_ms * 10;
+	unsigned int spin = PRU_EXEC_SPIN;
 
 	/* command word goes in last: parameter words are already set */
 	mbox[MBOX_CMD] = w0;
 
-	while (mbox[MBOX_COUNTER] == counter0) {
+	for (;;) {
+		if (mbox[MBOX_COUNTER] != counter0)
+			return ERROR_OK;
+
+		/* A register transaction is a few dozen SWCLK cycles - tens of
+		 * microseconds.  Poll the counter directly for that window
+		 * before falling back to sleeping: a fixed usleep(100) per
+		 * poll added ~100us to every single word transfer and halved
+		 * the effective throughput of block reads. */
+		if (spin) {
+			spin--;
+			continue;
+		}
 		if (polls-- == 0) {
 			LOG_ERROR("PRU did not complete command 0x%08x within %u ms "
 				"(is the PRUSS clock on?  try: "
@@ -117,8 +142,6 @@ static int pru_swd_exec(uint32_t w0, unsigned int timeout_ms)
 		}
 		usleep(100);
 	}
-
-	return ERROR_OK;
 }
 
 static void pru_swd_idle(unsigned int count)
