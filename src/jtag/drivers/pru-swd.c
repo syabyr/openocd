@@ -51,6 +51,7 @@
 #define MBOX_RESULT	16	/* word 16/17: results */
 #define MBOX_COUNTER	18	/* completion counter */
 #define MBOX_DELAY	20	/* half-phase delay iterations */
+#define MBOX_MAGIC	21	/* protocol magic written by v2 firmware */
 
 enum {
 	CMD_HALT = 0,
@@ -63,20 +64,24 @@ enum {
 	CMD_WRITE_REG,
 };
 
-/* PRU firmware timing: one delay-loop iteration costs ~5 PRU cycles
- * (see disassembly of the firmware loop) at 200 MHz = 25 ns, plus a
- * fixed per-phase overhead of roughly 100 ns for the GPIO OCP writes.
- * khz ~= 1e6 / (iters * 50 + 200)  [ns per clock period]
- */
-/* Measured on a BeagleBone Black (PRU 200 MHz): one half_phase()
- * iteration costs ~73 ns (volatile loop + __delay_cycles(1)), and each
- * clock carries ~200 ns of fixed OCP register-access overhead.  The
- * original estimate of 25 ns/iter made "adapter speed 1000" run at
- * ~400 kHz in practice.  13 cycles/iter keeps the real rate at or a
- * little below the requested rate after integer truncation. */
-#define PRU_DELAY_CYCLES_PER_ITER	13u
-#define PRU_MHZ			200u
-#define PRU_PHASE_FIXED_NS		200u
+/* full-byte commands (the v2 firmware decodes all 8 bits of word 0) */
+#define CMD_READ_BLOCK	0x09
+#define PRU_PROTO_V2	0x53574432u	/* "SWD2": block read support */
+#define PRU_BLOCK_OFF	0x400u		/* DRAM offset of the block buffer */
+#define PRU_BLOCK_MAX	1024u		/* words per batch (buffer holds 1792) */
+
+/* PRU firmware timing, measured on a BeagleBone Black with prupoke's
+ * timing mode (5000-clock averages): one SWCLK period is ~440 ns with
+ * zero half_phase() delay iterations (back-to-back OCP GPIO writes
+ * pipeline that fast) and grows by ~160-190 ns per iteration.  The
+ * speed mapping picks the nearest tier at or below the requested
+ * period; the real rate can land up to ~15% above the request because
+ * the iteration granularity is coarse.  Requests of 1800 kHz and up
+ * run at the iters=0 OCP-paced floor, ~2.3 MHz measured - that is the
+ * practical ceiling for bit-banging SWCLK through GPIO1 over OCP. */
+#define PRU_DELAY_NS_PER_ITER		190u
+#define PRU_PHASE_FIXED_NS		222u
+#define PRU_OCP_FLOOR_NS		550u
 #define PRU_MAX_KHZ		2000u
 
 /* Busy-poll iterations before pru_swd_exec falls back to usleep(100).
@@ -98,6 +103,15 @@ static uint32_t saved_gpio_oe, saved_gpio_dataout;
 static const uint32_t swd_pin_mask = (1u << 13) | (1u << 12) | (1u << 15);
 
 static int queued_retval;
+
+/* v2 firmware protocol: AP DRW reads can be replayed in one mailbox
+ * command (CMD_READ_BLOCK).  fw_block_read is set at init from the
+ * magic word the firmware writes at boot; with a v1 firmware the
+ * driver silently stays on the single-word path. */
+static int fw_block_read;
+static uint32_t *pend_value[PRU_BLOCK_MAX];
+static unsigned int pend_count;
+static uint32_t pend_cmd8, pend_delay;
 
 static inline uint32_t pru_ctrl_read(uint32_t offset)
 {
@@ -144,8 +158,55 @@ static int pru_swd_exec(uint32_t w0, unsigned int timeout_ms)
 	}
 }
 
+/* Execute buffered AP DRW reads as one CMD_READ_BLOCK: the PRU replays
+ * the read transaction `count' times without a mailbox round trip per
+ * word, stores the data at DRAM 0x400 and reports how many words
+ * completed.  Callers must invoke this *before* writing any other
+ * mailbox parameter words - it uses MBOX_DATA itself. */
+static void pru_swd_flush_pending_reads(void)
+{
+	if (!pend_count)
+		return;
+
+	unsigned int count = pend_count;
+
+	pend_count = 0;		/* first: so nothing below can re-enter */
+
+	pru0_dram[MBOX_DATA] = count;
+	int retval = pru_swd_exec(CMD_READ_BLOCK | (pend_cmd8 << 8)
+			| (pend_delay << 24), 5000);
+	if (retval != ERROR_OK) {
+		queued_retval = ERROR_FAIL;
+		return;
+	}
+
+	uint32_t res = pru0_dram[MBOX_RESULT];
+	uint32_t ack = res & 0x7;
+	unsigned int done = pru0_dram[MBOX_RESULT + 1];
+	if (done > count)
+		done = count;
+
+	for (unsigned int i = 0; i < done; i++)
+		if (pend_value[i])
+			*pend_value[i] = pruss_map[PRU_BLOCK_OFF / 4 + i];
+
+	if (ack != SWD_ACK_OK || (res & 0x8)) {
+		LOG_DEBUG("block read stopped after %u/%u words: ack=%u%s",
+			  done, count, ack, (res & 0x8) ? ", parity error" : "");
+		if (res & 0x8)
+			queued_retval = ERROR_FAIL;
+		else if (ack == SWD_ACK_FAULT)
+			queued_retval = ERROR_SWD_FAULT;
+		else if (ack == SWD_ACK_WAIT)
+			queued_retval = ERROR_WAIT;
+		else
+			queued_retval = ERROR_SWD_FAIL;
+	}
+}
+
 static void pru_swd_idle(unsigned int count)
 {
+	pru_swd_flush_pending_reads();
 	pru0_dram[MBOX_DATA] = count;
 	pru_swd_exec(CMD_SIG_IDLE, 100);
 }
@@ -174,6 +235,10 @@ static int pru_swd_load_firmware(void)
 	size_t words = len / 4;
 	for (size_t i = 0; i < words; i++)
 		pruss_map[PRU0_IRAM_OFF / 4 + i] = image[i];
+
+	/* clear the protocol magic so a stale value from an earlier
+	 * firmware session cannot fake block-read support */
+	pru0_dram[MBOX_MAGIC] = 0;
 
 	/* release reset and enable; firmware entry point is 0 */
 	pru_ctrl_write(PRU_CTRL_CTRL, PRU_CTRL_SOFT_RST_N | PRU_CTRL_EN);
@@ -231,6 +296,10 @@ static int pru_swd_init(void)
 			return ERROR_JTAG_INIT_FAILED;
 		}
 		LOG_INFO("pru-swd: PRU0 firmware up, mailbox handshake ok");
+
+		fw_block_read = (pru0_dram[MBOX_MAGIC] == PRU_PROTO_V2);
+		LOG_INFO("pru-swd: firmware protocol v2: %s",
+			fw_block_read ? "block reads enabled" : "single-word reads only");
 	}
 
 	return ERROR_OK;
@@ -238,6 +307,7 @@ static int pru_swd_init(void)
 
 static int pru_swd_quit(void)
 {
+	pend_count = 0;		/* drop buffered reads: session is over */
 	if (pruss_map) {
 		/* ask firmware to stop touching the pins, then disable the PRU.
 		 * The PRU polls for a *non-zero* command word, so HALT (=0)
@@ -271,6 +341,7 @@ static int pru_swd_quit(void)
 static void pru_swd_clear_sticky_errors(void)
 {
 	queued_retval = ERROR_OK;
+	pru_swd_flush_pending_reads();
 	pru0_dram[MBOX_DATA] = STKCMPCLR | STKERRCLR | WDERRCLR | ORUNERRCLR;
 	pru_swd_exec(CMD_WRITE_REG
 			| ((uint32_t)swd_cmd(false, false, DP_ABORT) << 8), 100);
@@ -280,6 +351,8 @@ static int pru_swd_switch_seq(enum swd_special_seq seq)
 {
 	const uint8_t *buf;
 	unsigned int len, idle_after = 0;
+
+	pru_swd_flush_pending_reads();
 
 	switch (seq) {
 	case LINE_RESET:
@@ -349,10 +422,29 @@ static void pru_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_hin
 		return;
 	}
 
-	for (unsigned int retries = 128; ; retries--) {
-		uint32_t delay = (cmd & SWD_CMD_APNDP) ? ap_delay_hint : 0;
-		uint32_t cmd8 = cmd | SWD_CMD_START | SWD_CMD_PARK;
+	uint32_t cmd8 = cmd | SWD_CMD_START | SWD_CMD_PARK;
+	uint32_t delay = (cmd & SWD_CMD_APNDP) ? ap_delay_hint : 0;
 
+	/* AP DRW reads come in long runs (mem-ap block reads rely on TAR
+	 * auto-increment).  Buffer them and replay with a single mailbox
+	 * command: the per-word round trip dominated read throughput. */
+	if (fw_block_read && (cmd & SWD_CMD_APNDP)
+			&& (cmd & SWD_CMD_A32) == SWD_CMD_A32) {
+		if (pend_count && pend_cmd8 != cmd8)
+			pru_swd_flush_pending_reads();
+		if (!pend_count) {
+			pend_cmd8 = cmd8;
+			pend_delay = delay;
+		}
+		pend_value[pend_count++] = value;
+		if (pend_count == PRU_BLOCK_MAX)
+			pru_swd_flush_pending_reads();
+		return;
+	}
+
+	pru_swd_flush_pending_reads();
+
+	for (unsigned int retries = 128; ; retries--) {
 		int retval = pru_swd_exec(CMD_READ_REG | (cmd8 << 8) | (delay << 24), 1000);
 		if (retval != ERROR_OK) {
 			queued_retval = ERROR_FAIL;
@@ -411,6 +503,8 @@ static void pru_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_hin
 		return;
 	}
 
+	pru_swd_flush_pending_reads();
+
 	for (unsigned int retries = 128; ; retries--) {
 		uint32_t delay = (cmd & SWD_CMD_APNDP) ? ap_delay_hint : 0;
 		uint32_t cmd8 = cmd | SWD_CMD_START | SWD_CMD_PARK;
@@ -459,6 +553,7 @@ static void pru_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_hin
 
 static int pru_swd_run_queue(void)
 {
+	pru_swd_flush_pending_reads();
 	pru_swd_idle(8);
 	int retval = queued_retval;
 	queued_retval = ERROR_OK;
@@ -512,6 +607,7 @@ static int pru_swd_execute_queue(struct jtag_command *cmd_queue)
 {
 	struct jtag_command *cmd = cmd_queue;
 
+	pru_swd_flush_pending_reads();
 	while (cmd) {
 		pru_swd_execute_command(cmd);
 		cmd = cmd->next;
@@ -524,10 +620,10 @@ static int pru_swd_speed(int speed)
 {
 	/* speed is in kHz (see pru_swd_khz); translate to delay iterations */
 	if (pru0_dram) {
-		uint32_t iters = (1000000u / (uint32_t)speed - PRU_PHASE_FIXED_NS)
-				/ (2u * PRU_DELAY_CYCLES_PER_ITER * 1000u / PRU_MHZ);
-		if (iters < 1)
-			iters = 1;
+		uint32_t period_ns = 1000000u / (uint32_t)speed;
+		uint32_t iters = period_ns <= PRU_OCP_FLOOR_NS ? 0u
+			: (period_ns - PRU_PHASE_FIXED_NS) / PRU_DELAY_NS_PER_ITER;
+
 		pru0_dram[MBOX_DELAY] = iters;
 		LOG_INFO("pru-swd: SWCLK half-phase delay %u iterations (~%d kHz)",
 			iters, speed);

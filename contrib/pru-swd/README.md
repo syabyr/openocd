@@ -80,6 +80,14 @@ The lines are push-pull, **not** 5 V tolerant: target I/O must be 3.3 V.
    clears `STANDBY_INIT` in the PRUSS SYSCFG first).  SWDIO direction
    turnaround is done by flipping the GPIO OE bit between clock edges,
    exactly like the original bbg-swd.
+4. **Block reads.**  The firmware writes a protocol magic
+   (`0x53574432`, "SWD2") into mailbox word 21 at boot; the host
+   zeroes the word before releasing the PRU, so finding it set proves
+   a freshly started firmware with block support.  When present, the
+   driver batches queued AP DRW reads (TAR auto-increments) up to 1024
+   words into a single mailbox command; the PRU fills a buffer at DRAM
+   `0x400` and the host copies it out, keeping per-word mailbox round
+   trips off the wire-time path.
 
 ## Requirements
 
@@ -218,7 +226,7 @@ Expected output on a healthy board:
 Info : pru-swd: SWD via PRU-ICSS (P8_11=SWDIO P8_12=SWCLK P8_15=nRST)
 Info : pru-swd: loading firmware /lib/firmware/pru-swd.bin (1400 bytes) into PRU0 IRAM
 Info : pru-swd: PRU0 firmware up, mailbox handshake ok
-Info : pru-swd: SWCLK half-phase delay 62 iterations (~300 kHz)
+Info : pru-swd: SWCLK half-phase delay 16 iterations (~300 kHz)
 Info : clock speed 300 kHz
 ```
 
@@ -237,6 +245,13 @@ prints PC/CTRL/SYSCFG and runs one mailbox command.
 ```sh
 cc -O2 -o prupoke prupoke.c        # on the BeagleBone
 ./prupoke                          # or: ./prupoke /path/to/pru-swd.bin
+```
+
+It also has a timing mode (no target needed) used to calibrate the
+driver's `adapter speed` → delay-iteration mapping (see Timing):
+
+```sh
+./prupoke t 0 5000                 # <delay iters> <clock count>
 ```
 
 Healthy firmware:
@@ -265,9 +280,10 @@ Words are 32-bit, little endian, in PRU0 DRAM (host view: PRUSS
 | 16 | PRU→host | result: READ `parity<<31 \| ack`, WRITE `ack`, GPIO_IN raw `GPIO1.DATAIN` |
 | 17 | PRU→host | READ: data word |
 | 18 | PRU→host | completion counter, incremented after every command |
-| 20 | host→PRU | half-phase delay iterations (firmware default 100 ≈ 190 kHz) |
+| 20 | host→PRU | half-phase delay iterations (firmware default 100 ≈ 110 kHz; 0 = OCP-paced ~2.3 MHz) |
+| 21 | PRU→host | protocol magic: firmware writes `0x53574432` ("SWD2") at boot.  The host zeroes it before releasing the PRU, so a set value proves a freshly started v2 firmware — stale DRAM cannot fake block support. |
 
-Commands (`word0[7:0]`):
+Commands (`word0[7:0]`, decoded over all 8 bits):
 
 | Code | Command | Notes |
 |---|---|---|
@@ -279,6 +295,8 @@ Commands (`word0[7:0]`):
 | 5 | SIG_GEN | byte 1 = bit count (≤256), words 1..8 pattern, LSB first |
 | 6 | READ_REG | SWD transaction: 8 request bits, TRN, 3 ack, 32 data, parity, TRN (46 clocks) |
 | 7 | WRITE_REG | SWD transaction: 8 request bits, TRN, 3 ack, TRN, 32 data, parity (46 clocks) |
+| 8 | HALT (alt encoding) | same as 0 — the non-zero encoding hosts must use |
+| 9 | READ_BLOCK | like READ_REG but word 1 = count (≤1024): that many identical AP register reads (TAR auto-increments), WAIT retried up to 8× per word in firmware, results stored at DRAM byte `0x400` upward.  result 16 = ack with bit 3 set on parity mismatch, result 17 = words completed (buffer valid up to that many words) |
 
 Both register commands are preceded by 2 idle clocks with SWDIO driven
 low.  Idle clocks must keep SWDIO **low**: a high clock is taken for the
@@ -291,29 +309,37 @@ symptom: the first one or two writes succeed, then ack=7 forever.
 ## Timing
 
 SWDIO setup/sample happens against the SWCLK rising edge.  Measured on
-a BeagleBone Black: each half phase costs one fixed ~200 ns of OCP
-register access plus ~73 ns per delay-loop iteration (the volatile
-loop body is heavier than the 5 cycles `__delay_cycles(1)` suggests),
-so a full SWCLK period is `2 × (73 × n + 100) ns`.  The driver maps
-`adapter speed` to iterations as
-`(1000000/kHz − 200) / 130`:
+a BeagleBone Black with prupoke's timing mode (5000-clock averages): a
+SWCLK period is ~440 ns with zero delay-loop iterations — back-to-back
+OCP GPIO register writes pipeline that fast — and grows by ~160–190 ns
+per iteration.  The driver maps `adapter speed` to the nearest delay
+tier at or below the requested period, so the real rate can land a
+little above the request:
 
-| adapter speed | delay iterations | real rate |
-|---:|---:|---:|
-| 2000 kHz | 2 | ~2.0 MHz |
-| 1000 kHz | 6 | ~0.9 MHz |
-| 500 kHz | 13 | ~0.5 MHz |
-| 300 kHz | 24 | ~0.27 MHz |
-| 100 kHz | 75 | ~95 kHz |
+| adapter speed | delay iterations | measured rate | 256 KiB flash read |
+|---:|---:|---:|---:|
+| 2000 kHz | 0 | ~2.3 MHz | 1.8 s |
+| 1800 kHz | 1 | ~1.9 MHz | 2.3 s |
+| 1000 kHz | 4 | ~1.0 MHz | 3.7 s |
+| 500 kHz | 9 | ~0.55 MHz | 6.2 s |
+| 300 kHz | 16 | ~0.35 MHz | 9.5 s |
 
-2 MHz is the driver's clamp.  Long flat cables, level shifters or a
-target with weak drive may need 300 kHz or below.
+2 MHz is the driver's clamp; requests of 1800 kHz and above all run at
+the zero-iteration OCP-paced floor (~2.3 MHz).  That floor is the
+practical ceiling for bit-banging SWCLK through GPIO1 over the OCP
+master port: every clock edge needs a GPIO1 SETDATAOUT/CLEARDATAOUT
+write, and two of those writes pipeline to ~440 ns.  (Moving the pins
+to the PRU-ICSS-local I/O lines driven by R30/R31 would remove the OCP
+writes from the clock path entirely, but those balls are on different
+header pins and the SWDIO turnaround would need reworking — not
+implemented.)  Long flat cables, level shifters or a target with weak
+drive may need 300 kHz or below.
 
-Reference throughput reading 256 KiB of STM32F401 flash
-(`flash read_bank`): ~3.2 s at 2 MHz, ~5.1 s at 1 MHz, ~13.7 s at
-300 kHz.  A 32-bit word costs one SWD transaction (50 clocks with the
-leading idle) plus ~16 µs of host-side mailbox and queue overhead per
-word.
+Reference throughput: 256 KiB of STM32F401 flash, read as AP DRW
+transactions with TAR auto-increment, batched 1024 words per mailbox
+round trip (times in the table; ~143 KiB/s at the top tier).  A 32-bit
+word costs one 48-clock SWD transaction; host-side overhead is
+amortized well below the wire time by the block read command.
 
 ## Troubleshooting
 

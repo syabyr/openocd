@@ -2,6 +2,12 @@
  *
  * Mirrors the openocd pruswd driver: load pru-swd.bin into PRU0 IRAM,
  * then report PC/CTRL and run a mailbox handshake (CMD_GPIO_IN=3).
+ *
+ * Timing mode (no target needed):
+ *   prupoke t <iters> <clocks>
+ * times CMD_SIG_IDLE of <clocks> clocks at half-phase delay <iters>
+ * and one 46-clock read transaction, and prints ns/clock.  Used to
+ * calibrate the driver's iters = f(adapter speed) mapping.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +17,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <stdint.h>
+#include <time.h>
 
 #define PRUSS_BASE	0x4A300000u
 #define PRUSS_SIZE	0x40000u
@@ -19,9 +26,71 @@
 #define IRAM_SIZE	0x2000
 #define SYSCFG_OFF	0x26004
 
+#define MBOX_CMD	0
+#define MBOX_DATA	1
+#define MBOX_RESULT	16
+#define MBOX_COUNTER	18
+#define MBOX_DELAY	20
+
+static volatile uint32_t *dram;
+
+static uint32_t exec_cmd(uint32_t w0, const char *what)
+{
+	uint32_t c0 = dram[MBOX_COUNTER];
+
+	dram[MBOX_CMD] = w0;
+	for (int i = 0; i < 5000; i++) {
+		if (dram[MBOX_COUNTER] != c0)
+			return dram[MBOX_RESULT];
+		usleep(1000);
+	}
+	fprintf(stderr, "PRU did not complete %s (w0=%08x)\n", what, w0);
+	exit(1);
+}
+
+static double now_s(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* ---- timing mode ---- */
+static int timing_mode(int iters, int clocks)
+{
+	dram[MBOX_DELAY] = iters;
+
+	/* warm-up + settle (CMD_SIG_IDLE=4, clock count in DATA) */
+	dram[MBOX_DATA] = clocks;
+	exec_cmd(4, "SIG_IDLE warmup");
+
+	int reps = 20;
+	double t0 = now_s();
+	for (int i = 0; i < reps; i++) {
+		dram[MBOX_DATA] = clocks;
+		exec_cmd(4, "SIG_IDLE");
+	}
+	double dt = now_s() - t0;
+
+	/* one read transaction: 2 idle + 8 req + TRN + 3 ack + 32 data
+	 * + parity + TRN = 48 clocks, 36 of them sampling SWDIO */
+	t0 = now_s();
+	exec_cmd(6 | (0xA5u << 8), "READ_REG");
+	double dt_xact = now_s() - t0;
+
+	printf("iters=%d clocks=%d reps=%d\n", iters, clocks, reps);
+	printf("idle: %.1f us/cmd -> %.0f ns/clock\n",
+		dt / reps * 1e6, dt / reps / clocks * 1e9);
+	printf("read xact (48 clocks, 36 sampled): %.1f us -> %.0f ns/clock\n",
+		dt_xact * 1e6, dt_xact / 48 * 1e9);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	const char *fw_path = argc > 1 ? argv[1] : "/lib/firmware/pru-swd.bin";
+	const char *fw_path = (argc > 1 && strcmp(argv[1], "t") != 0)
+		? argv[1] : "/lib/firmware/pru-swd.bin";
 	int fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
 	if (fd < 0) { perror("open /dev/gpiomem"); return 1; }
 
@@ -31,7 +100,6 @@ int main(int argc, char **argv)
 
 	volatile uint32_t *ctrl = &pru[CTRL_OFF / 4];
 	volatile uint32_t *iram = &pru[IRAM_OFF / 4];
-	volatile uint32_t *dram = &pru[0];
 	volatile uint32_t *syscfg = &pru[SYSCFG_OFF / 4];
 
 	printf("before: CTRL=%08x PC=%08x SYSCFG=%08x\n",
@@ -50,6 +118,11 @@ int main(int argc, char **argv)
 		iram[i] = image[i];
 	ctrl[0] = 3;			/* SOFT_RST_N | EN */
 	usleep(1000);
+
+	dram = pru;			/* global for exec_cmd/timing_mode */
+
+	if (argc == 4 && strcmp(argv[1], "t") == 0)
+		return timing_mode(atoi(argv[2]), atoi(argv[3]));
 
 	printf("after load: CTRL=%08x\n", ctrl[0]);
 	for (int i = 0; i < 5; i++) {

@@ -28,6 +28,12 @@
  *   17     result 1 (READ: data word)
  *   18     completion counter (host snapshots, waits for it to change)
  *   20     half-phase delay loop iterations, host writable, fw default 100
+ *   21     protocol magic: firmware writes 0x53574432 ("SWD2") at boot;
+ *          the host zeroes it before releasing the PRU so a stale value
+ *          cannot fake block-command support
+ *
+ * Block read buffer: PRU0 DRAM byte 0x400 upward (words 256..); the
+ * linker keeps .data/.bss/.stack below it.
  */
 
 #include <stdint.h>
@@ -53,6 +59,13 @@
 #define MBOX_RESULT	16
 #define MBOX_COUNTER	18
 #define MBOX_DELAY	20
+#define MBOX_MAGIC	21
+#define MBOX_BLOCK	((volatile uint32_t *)0x00000400u)
+
+#define PROTO_MAGIC_V2	0x53574432u	/* "SWD2": block read support */
+
+#define ACK_OK		1u
+#define ACK_WAIT	2u
 
 enum {
 	CMD_HALT = 0,
@@ -63,6 +76,9 @@ enum {
 	CMD_SIG_GEN,			/* byte1 = bit count, words1..8 = pattern */
 	CMD_READ_REG,
 	CMD_WRITE_REG,
+	/* full-byte commands (main decodes all 8 bits): */
+	CMD_HALT_W0 = 0x08,		/* HALT, encoded non-zero (see main) */
+	CMD_READ_BLOCK = 0x09,		/* word1 = count, data -> 0x400 */
 };
 
 static volatile uint32_t * const gpio1 = (volatile uint32_t *)GPIO1_BASE;
@@ -92,15 +108,15 @@ static inline void dio_set_input(void)
 
 /* One SWCLK half phase.  Iteration count is host controlled (mailbox
  * word 20) so the host can trade speed for margin without reflashing.
- * Loop body costs a few PRU cycles per iteration; the host "adapter
- * speed" mapping is calibrated conservatively.
+ * Measured on a BeagleBone Black: one loop iteration costs ~85 ns,
+ * each OCP GPIO register access ~300 ns, so a full clock is
+ * 2 x (85 x n + 298) ns; n = 0 is valid and paces the clock by the
+ * OCP accesses alone (~600 ns per clock, ~1.7 MHz).
  */
 static inline void half_phase(void)
 {
 	volatile uint32_t n = MBOX[MBOX_DELAY];
 
-	if (!n)
-		n = 100;		/* safe fallback */
 	while (n--)
 		__delay_cycles(1);
 }
@@ -161,11 +177,15 @@ static void cmd_sig_gen(uint32_t w0)
 	MBOX[MBOX_RESULT] = 0;
 }
 
-static void cmd_read_reg(uint32_t w0)
+/* One SWD read transaction: leading idle, request, TRN, ack, data,
+ * parity, trailing TRN.  Returns the ack; *data gets the payload,
+ * *parity the received parity bit, *pok is 0 when the received parity
+ * does not match the data.  Leaves SWDIO as input (trailing TRN) -
+ * the caller parks the line. */
+static uint32_t swd_read_xact(uint32_t cmd8, uint32_t *data,
+			      uint32_t *parity, uint32_t *pok)
 {
-	uint32_t cmd8 = (w0 >> 8) & 0xff;
-	uint32_t idle = (w0 >> 24) & 0xff;
-	uint32_t ack = 0, data = 0;
+	uint32_t ack = 0, d = 0, calc = 0;
 
 	/* Inter-transaction idle.  SWDIO must be driven LOW while idling:
 	 * a high clock would be taken for the START bit of a request and
@@ -180,15 +200,32 @@ static void cmd_read_reg(uint32_t w0)
 
 	for (uint32_t i = 0; i < 3; i++)	/* ACK, LSB first */
 		ack |= read_bit() ? (1u << i) : 0;
-	for (uint32_t i = 0; i < 32; i++)	/* RDATA, LSB first */
-		data |= read_bit() ? (1u << i) : 0;
-	uint32_t parity = read_bit();
+	for (uint32_t i = 0; i < 32; i++) {	/* RDATA, LSB first */
+		uint32_t b = read_bit() ? 1u : 0;
+		d |= b << i;
+		calc ^= b;			/* even parity over data */
+	}
+	uint32_t rp = read_bit() ? 1u : 0;
 
 	/* TRN back to host */
 	clk_low();
 	half_phase();
 	clk_high();
 	half_phase();
+
+	*data = d;
+	*parity = rp;
+	*pok = (calc == rp);
+	return ack;
+}
+
+static void cmd_read_reg(uint32_t w0)
+{
+	uint32_t cmd8 = (w0 >> 8) & 0xff;
+	uint32_t idle = (w0 >> 24) & 0xff;
+	uint32_t data, parity, pok;
+
+	uint32_t ack = swd_read_xact(cmd8, &data, &parity, &pok);
 
 	if (idle) {				/* ap_delay idle clocks */
 		dio_drive(SWDIO_MASK, 0);
@@ -200,6 +237,47 @@ static void cmd_read_reg(uint32_t w0)
 
 	MBOX[MBOX_RESULT] = (parity ? (1u << 31) : 0) | (ack & 7);
 	MBOX[MBOX_RESULT + 1] = data;
+}
+
+/* CMD_READ_BLOCK: word1 = count of identical AP register read
+ * transactions (the host queues AP DRW reads, TAR auto-increments);
+ * results are stored to DRAM 0x400.  WAIT is retried in firmware.
+ * result0 = ack with bit 3 set on a parity mismatch, result1 = number
+ * of complete words (data valid for that many words). */
+static void cmd_read_block(uint32_t w0)
+{
+	uint32_t cmd8 = (w0 >> 8) & 0xff;
+	uint32_t idle = (w0 >> 24) & 0xff;
+	uint32_t count = MBOX[MBOX_DATA];
+
+	for (uint32_t done = 0; done < count; done++) {
+		uint32_t data, parity, pok, ack = 0;
+		uint32_t tries = 8;
+
+		do {
+			ack = swd_read_xact(cmd8, &data, &parity, &pok);
+		} while (ack == ACK_WAIT && --tries);
+
+		if (ack != ACK_OK || !pok) {
+			dio_drive(SWDIO_MASK, 0);
+			dio_set_output();
+			MBOX[MBOX_RESULT] = (ack & 7) | (!pok ? 0x8u : 0);
+			MBOX[MBOX_RESULT + 1] = done;
+			return;
+		}
+		MBOX_BLOCK[done] = data;
+
+		if (idle) {			/* ap_delay idle clocks */
+			dio_drive(SWDIO_MASK, 0);
+			dio_set_output();
+			sig_idle_cycles(idle);
+		}
+		dio_drive(SWDIO_MASK, 0);	/* spec idle level is low */
+		dio_set_output();
+	}
+
+	MBOX[MBOX_RESULT] = ACK_OK;
+	MBOX[MBOX_RESULT + 1] = count;
 }
 
 static void cmd_write_reg(uint32_t w0)
@@ -270,6 +348,7 @@ void main(void)
 	MBOX[MBOX_RESULT] = 0;
 	MBOX[MBOX_RESULT + 1] = 0;
 	MBOX[MBOX_COUNTER] = 0;
+	MBOX[MBOX_MAGIC] = PROTO_MAGIC_V2;
 
 	for (;;) {
 		uint32_t w0;
@@ -279,8 +358,9 @@ void main(void)
 
 		MBOX[MBOX_CMD] = 0;		/* consumed — host ACK */
 
-		switch (w0 & 7) {
+		switch (w0 & 0xff) {
 		case CMD_HALT:
+		case CMD_HALT_W0:		/* non-zero encoding, old drivers */
 			MBOX[MBOX_RESULT] = 0;
 			MBOX[MBOX_COUNTER]++;
 			__halt();		/* host clears CTRL.EN after */
@@ -311,6 +391,9 @@ void main(void)
 			break;
 		case CMD_WRITE_REG:
 			cmd_write_reg(w0);
+			break;
+		case CMD_READ_BLOCK:
+			cmd_read_block(w0);
 			break;
 		}
 

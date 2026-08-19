@@ -9,7 +9,11 @@
 MEMORY
 {
 	PAGE 0:  PRU_IMEM (RWX) : org = 0x00000000, len = 0x8000
-	PAGE 1:  PRU_DMEM (RW)  : org = 0x00000100, len = 0x7F00
+	/* 0x100-0x400 only: .data/.bss/.stack must stay below the block
+	 * read buffer, which the firmware and host place at DRAM 0x400.
+	 * If the firmware ever outgrows this, the link fails loudly here
+	 * instead of silently overlapping that buffer. */
+	PAGE 1:  PRU_DMEM (RW)  : org = 0x00000100, len = 0x300
 }
 
 SECTIONS
