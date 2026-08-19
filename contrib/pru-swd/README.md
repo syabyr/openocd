@@ -277,8 +277,16 @@ Commands (`word0[7:0]`):
 | 3 | GPIO_IN | result 16 = GPIO1 DATAIN |
 | 4 | SIG_IDLE | word 1 = idle clocks, SWDIO parked low |
 | 5 | SIG_GEN | byte 1 = bit count (≤256), words 1..8 pattern, LSB first |
-| 6 | READ_REG | SWD transaction: 8 request bits, TRN, 3 ack, 32 data, parity, TRN |
-| 7 | WRITE_REG | SWD transaction: 8 request bits, TRN+ack, 32 data + parity (TRN fused with first data bit) |
+| 6 | READ_REG | SWD transaction: 8 request bits, TRN, 3 ack, 32 data, parity, TRN (46 clocks) |
+| 7 | WRITE_REG | SWD transaction: 8 request bits, TRN, 3 ack, TRN, 32 data, parity (46 clocks) |
+
+Both register commands are preceded by 2 idle clocks with SWDIO driven
+low.  Idle clocks must keep SWDIO **low**: a high clock is taken for the
+START bit of a request, shifting the whole transaction (the target then
+stays silent and the ack reads 7).  The write turnaround before WDATA is
+its own unsampled clock — fusing it with data bit 0 shortens the
+transaction to 45 clocks and misaligns every transaction after it,
+symptom: the first one or two writes succeed, then ack=7 forever.
 
 ## Timing
 

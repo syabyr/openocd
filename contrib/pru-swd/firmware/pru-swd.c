@@ -167,6 +167,12 @@ static void cmd_read_reg(uint32_t w0)
 	uint32_t idle = (w0 >> 24) & 0xff;
 	uint32_t ack = 0, data = 0;
 
+	/* Inter-transaction idle.  SWDIO must be driven LOW while idling:
+	 * a high clock would be taken for the START bit of a request and
+	 * shift the whole transaction (target goes silent, ack reads 7). */
+	dio_set_output();
+	dio_drive(SWDIO_MASK, 0);
+	sig_idle_cycles(2);
 	for (uint32_t i = 0; i < 8; i++)	/* request, LSB first */
 		write_bit((cmd8 >> i) & 1);
 
@@ -189,7 +195,7 @@ static void cmd_read_reg(uint32_t w0)
 		dio_set_output();
 		sig_idle_cycles(idle);
 	}
-	dio_drive(SWDIO_MASK, 1);
+	dio_drive(SWDIO_MASK, 0);		/* spec idle level is low */
 	dio_set_output();
 
 	MBOX[MBOX_RESULT] = (parity ? (1u << 31) : 0) | (ack & 7);
@@ -204,6 +210,10 @@ static void cmd_write_reg(uint32_t w0)
 	uint32_t val = MBOX[MBOX_DATA];
 	uint32_t ack = 0;
 
+	/* Inter-transaction idle, SWDIO low (see cmd_read_reg) */
+	dio_set_output();
+	dio_drive(SWDIO_MASK, 0);
+	sig_idle_cycles(2);
 	for (uint32_t i = 0; i < 8; i++)	/* request, LSB first */
 		write_bit((cmd8 >> i) & 1);
 
@@ -212,16 +222,18 @@ static void cmd_write_reg(uint32_t w0)
 	for (uint32_t i = 0; i < 3; i++)	/* ACK, LSB first */
 		ack |= read_bit() ? (1u << i) : 0;
 
-	/* TRN + first WDATA bit fused: drive while clock is low */
+	/* Second turnaround: host takes the bus back.  TRN is its own clock,
+	 * not sampled by the target — fusing it with data bit 0 made the
+	 * whole transaction 45 instead of 46 clocks and shifted every write
+	 * after the first (symptom: DP goes silent, ack=7). */
 	clk_low();
-	half_phase();
 	dio_drive(SWDIO_MASK, val & 1);
 	dio_set_output();
 	half_phase();
-	clk_high();
+	clk_high();				/* TRN clock, not sampled */
 	half_phase();
 
-	for (uint32_t i = 1; i < 32; i++)
+	for (uint32_t i = 0; i < 32; i++)	/* WDATA, LSB first */
 		write_bit((val >> i) & 1);
 	write_bit(dparity & 1);			/* WDATA parity */
 
@@ -229,7 +241,7 @@ static void cmd_write_reg(uint32_t w0)
 		dio_drive(SWDIO_MASK, 0);
 		sig_idle_cycles(idle);
 	}
-	dio_drive(SWDIO_MASK, 1);
+	dio_drive(SWDIO_MASK, 0);		/* spec idle level is low */
 
 	MBOX[MBOX_RESULT] = ack & 7;
 }
