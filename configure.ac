@@ -218,7 +218,8 @@ m4_define([HOST_ARM_BITBANG_ADAPTERS],
 m4_define([HOST_ARM_OR_AARCH64_BITBANG_ADAPTERS],
 	[[[bcm2835gpio], [Bitbanging on BCM2835 (as found in Raspberry Pi)], [BCM2835GPIO]],
 	[[imx_gpio], [Bitbanging on NXP IMX processors], [IMX_GPIO]],
-	[[am335xgpio], [Bitbanging on AM335x (as found in Beaglebones)], [AM335XGPIO]]])
+	[[am335xgpio], [Bitbanging on AM335x (as found in Beaglebones)], [AM335XGPIO]],
+	[[pruswd], [SWD via PRU-ICSS on AM335x (BeagleBone)], [PRUSWD]]])
 
 m4_define([DUMMY_ADAPTER],
 	[[[dummy], [Dummy Adapter], [DUMMY]]])

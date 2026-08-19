@@ -210,6 +210,10 @@ endif
 if AM335XGPIO
 DRIVERFILES += %D%/am335xgpio.c
 endif
+
+if PRUSWD
+DRIVERFILES += %D%/pru-swd.c
+endif
 if CH347
 DRIVERFILES += %D%/ch347.c
 endif

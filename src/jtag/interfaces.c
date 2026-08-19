@@ -41,6 +41,9 @@ struct adapter_driver *adapter_drivers[] = {
 #if BUILD_AM335XGPIO == 1
 		&am335xgpio_adapter_driver,
 #endif
+#if BUILD_PRUSWD == 1
+		&pru_swd_adapter_driver,
+#endif
 #if BUILD_AMTJTAGACCEL == 1
 		&amt_jtagaccel_adapter_driver,
 #endif
