@@ -103,9 +103,46 @@ static int timing_mode(int iters, int clocks)
 	return 0;
 }
 
+/* ---- dio self-test mode ----
+ * Drive the SWDIO node weakly (through the 1 kOhm) high via SIG_IDLE,
+ * read R31; then park it low via a READ_REG tail, read R31 again.
+ * idle target = high-Z, so the node should follow the host both ways.
+ * stuck-high on the second read means something is driving the node
+ * (or the read-back pin taps the wrong side). */
+static int dio_test_mode(void)
+{
+	uint32_t r_hi, r_lo;
+
+	dram[MBOX_DATA] = 2;
+	exec_cmd(4, "SIG_IDLE park-high");	/* parks SWDIO high */
+	r_hi = exec_cmd(0x0a, "PRU_IN");
+
+	exec_cmd(6 | (0xA5u << 8), "READ_REG park-low");	/* parks low */
+	r_lo = exec_cmd(0x0a, "PRU_IN");
+
+	printf("SWDIO node: driven-high read=%08x (want bit15=1), "
+		"driven-low read=%08x (want bit15=0)\n", r_hi, r_lo);
+	return 0;
+}
+
+/* ---- parklow mode ----
+ * Leave SWDIO weakly driven LOW (through the 1 kOhm) so a multimeter
+ * can map the resistor network.  With a powered, connected target the
+ * STM32's internal SWDIO pull-up (~40 k) should hold the TARGET side
+ * of the resistor near 3.2 V while the host (PRU) side sits near 0 V. */
+static int parklow_mode(void)
+{
+	exec_cmd(6 | (0xA5u << 8), "READ_REG park-low");
+	printf("SWDIO parked weak-low; measure now (PRU side ~0V, "
+		"target side ~3.2V if powered+connected)\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	const char *fw_path = (argc > 1 && strcmp(argv[1], "t") != 0)
+	const char *fw_path = (argc > 1 && strcmp(argv[1], "t") != 0
+				&& strcmp(argv[1], "dio") != 0
+				&& strcmp(argv[1], "parklow") != 0)
 		? argv[1] : "/lib/firmware/pru-swd.bin";
 	int fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
 	if (fd < 0) { perror("open /dev/gpiomem"); return 1; }
@@ -137,8 +174,19 @@ int main(int argc, char **argv)
 
 	dram = pru;			/* global for exec_cmd/timing_mode */
 
+	/* PRU DRAM survives PRU resets and is garbage after a board power
+	 * cycle; MBOX_DELAY (w20) is only written by timing mode and the
+	 * openocd driver.  Park it at a sane slow-ish value so the other
+	 * modes can't inherit a multi-hundred-million-iteration delay and
+	 * time out.  Timing mode overwrites this with its own <iters>. */
+	dram[MBOX_DELAY] = 2;
+
 	if (argc == 4 && strcmp(argv[1], "t") == 0)
 		return timing_mode(atoi(argv[2]), atoi(argv[3]));
+	if (argc == 2 && strcmp(argv[1], "dio") == 0)
+		return dio_test_mode();
+	if (argc == 2 && strcmp(argv[1], "parklow") == 0)
+		return parklow_mode();
 
 	printf("after load: CTRL=%08x\n", ctrl[0]);
 	for (int i = 0; i < 5; i++) {
@@ -156,6 +204,17 @@ int main(int argc, char **argv)
 	}
 	printf("counter after=%u mbox cmd=%08x result0=%08x delay(w20)=%08x\n",
 			dram[18], dram[0], dram[16], dram[20]);
+
+	/* R31 read-back probe (firmware v3: CMD_PRU_IN=0x0a; a v2 firmware
+	 * ignores the command, this just times out and prints a stale word) */
+	uint32_t c1 = dram[18];
+	dram[0] = 0x0a;
+	for (int i = 0; i < 500; i++) {
+		if (dram[18] != c1) break;
+		usleep(1000);
+	}
+	printf("R31 = %08x (bit15 = P8_15 SWDIO read-back node)\n", dram[16]);
+
 	printf("final PC=%08x SYSCFG=%08x GPCFG0=%08x GPCFG1=%08x\n",
 			ctrl[1], *syscfg, pru[0x2612c / 4], pru[0x26130 / 4]);
 	return 0;

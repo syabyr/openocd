@@ -11,11 +11,13 @@
  *   written straight into PRU0 IRAM, and the mailbox handshake is         *
  *   polling based (command word + completion counter in PRU0 DRAM).       *
  *                                                                         *
- *   Pins are fixed by the PRU firmware (pinned in mode 7 by the kernel    *
- *   pinmux hog):                                                          *
- *     P8_11 = GPIO1_13  SWDIO                                              *
- *     P8_12 = GPIO1_12  SWCLK                                              *
- *     P8_15 = GPIO1_15  nRST (optional)                                    *
+ *   Pins are fixed by the PRU firmware and the board device tree (see
+ *   contrib/pru-swd/docs/08-hardware-roadmap.md - hardware-rewired
+ *   adapter, SWDIO through a 1 kOhm series resistor):
+ *     P8_11 = pru0_r30_15  SWDIO drive  (pinmux mode 6)
+ *     P8_15 = pru0_r31_15  SWDIO read back (pinmux mode 6)
+ *     P8_12 = pru0_r30_14  SWCLK        (pinmux mode 6)
+ *     P8_26 = GPIO1_29     nRST (optional, host side only)
  ***************************************************************************/
 
 #ifdef HAVE_CONFIG_H
@@ -67,22 +69,23 @@ enum {
 /* full-byte commands (the v2 firmware decodes all 8 bits of word 0) */
 #define CMD_READ_BLOCK	0x09
 #define PRU_PROTO_V2	0x53574432u	/* "SWD2": block read support */
+#define PRU_PROTO_V3	0x53574433u	/* "SWD3": PRU-local SWDIO (R30/R31) */
 #define PRU_BLOCK_OFF	0x400u		/* DRAM offset of the block buffer */
 #define PRU_BLOCK_MAX	1024u		/* words per batch (buffer holds 1792) */
 
-/* PRU firmware timing, measured on a BeagleBone Black with prupoke's
- * timing mode (5000-clock averages): one SWCLK period is ~440 ns with
- * zero half_phase() delay iterations (back-to-back OCP GPIO writes
- * pipeline that fast) and grows by ~160-190 ns per iteration.  The
- * speed mapping picks the nearest tier at or below the requested
- * period; the real rate can land up to ~15% above the request because
- * the iteration granularity is coarse.  Requests of 1800 kHz and up
- * run at the iters=0 OCP-paced floor, ~2.3 MHz measured - that is the
- * practical ceiling for bit-banging SWCLK through GPIO1 over OCP. */
-#define PRU_DELAY_NS_PER_ITER		190u
-#define PRU_PHASE_FIXED_NS		222u
-#define PRU_OCP_FLOOR_NS		550u
-#define PRU_MAX_KHZ		2000u
+/* PRU firmware timing with all wire I/O PRU-local (R30/R31, no OCP
+ * access on the bit path).  The half_phase() delay loop is register
+ * only, so it alone paces the clock.  Measured with prupoke's timing
+ * mode on the rewired adapter (docs/06-timing.md): a read transaction
+ * averages 155 ns + 30 ns per delay iteration per SWCLK period
+ * (iters=1 -> ~5.4 MHz).  The SWDIO series resistor gives an RC of
+ * ~30 ns, covered by the >= 90 ns data setup of one half phase at
+ * iters=1; the driver keeps n >= 1 (ceiling ~5.4 MHz, clamped to
+ * 5 MHz). */
+#define PRU_LIO_FIXED_NS	155u
+#define PRU_LIO_PER_ITER_NS	30u
+#define PRU_LIO_MIN_ITERS	1u
+#define PRU_MAX_KHZ		5000u
 
 /* Busy-poll iterations before pru_swd_exec falls back to usleep(100).
  * One spin iteration is one uncached mmap read (~150 ns), so this
@@ -98,17 +101,18 @@ static int dev_mem_fd = -1;
 static volatile uint32_t *pruss_map;		/* PRUSS window */
 static volatile uint32_t *pru0_dram;		/* PRU0 DRAM mailbox */
 static volatile uint32_t *pru0_ctrl;
-static volatile uint32_t *gpio1_map;		/* GPIO1 regs, save/restore */
+static volatile uint32_t *gpio1_map;		/* GPIO1 regs, nRST save/restore */
 static uint32_t saved_gpio_oe, saved_gpio_dataout;
-static const uint32_t swd_pin_mask = (1u << 13) | (1u << 12) | (1u << 15);
+static const uint32_t nrst_pin_mask = 1u << 29;	/* P8_26, GPIO1_29 */
 
 static int queued_retval;
 
-/* v2 firmware protocol: AP DRW reads can be replayed in one mailbox
+/* v2/v3 firmware protocol: AP DRW reads can be replayed in one mailbox
  * command (CMD_READ_BLOCK).  fw_block_read is set at init from the
  * magic word the firmware writes at boot; with a v1 firmware the
  * driver silently stays on the single-word path. */
 static int fw_block_read;
+static int fw_local_io;		/* "SWD3": SWDIO/SWCLK on R30/R31 */
 static uint32_t *pend_value[PRU_BLOCK_MAX];
 static unsigned int pend_count;
 static uint32_t pend_cmd8, pend_delay;
@@ -247,7 +251,8 @@ static int pru_swd_load_firmware(void)
 
 static int pru_swd_init(void)
 {
-	LOG_INFO("pru-swd: SWD via PRU-ICSS (P8_11=SWDIO P8_12=SWCLK P8_15=nRST)");
+	LOG_INFO("pru-swd: SWD via PRU-ICSS, PRU-local pins "
+		"(P8_11=SWDIO-o P8_15=SWDIO-i P8_12=SWCLK P8_26=nRST)");
 
 	if (transport_is_swd() && !pruss_map) {
 		dev_mem_fd = open("/dev/gpiomem", O_RDWR | O_SYNC);
@@ -297,9 +302,16 @@ static int pru_swd_init(void)
 		}
 		LOG_INFO("pru-swd: PRU0 firmware up, mailbox handshake ok");
 
-		fw_block_read = (pru0_dram[MBOX_MAGIC] == PRU_PROTO_V2);
-		LOG_INFO("pru-swd: firmware protocol v2: %s",
-			fw_block_read ? "block reads enabled" : "single-word reads only");
+		uint32_t magic = pru0_dram[MBOX_MAGIC];
+		fw_block_read = (magic == PRU_PROTO_V2 || magic == PRU_PROTO_V3);
+		fw_local_io = (magic == PRU_PROTO_V3);
+		LOG_INFO("pru-swd: firmware protocol: %s",
+			fw_local_io ? "v3 (PRU-local SWDIO, block reads)" :
+			fw_block_read ? "v2 (block reads)" : "v1 (single-word reads)");
+		if (!fw_local_io)
+			LOG_WARNING("pru-swd: firmware is not the PRU-local SWDIO build; "
+				"this driver expects the hardware-rewired adapter "
+				"(contrib/pru-swd/docs/08-hardware-roadmap.md)");
 	}
 
 	return ERROR_OK;
@@ -315,11 +327,12 @@ static int pru_swd_quit(void)
 		pru_swd_exec(CMD_HALT | 0x8, 100);
 		pru_ctrl_write(PRU_CTRL_CTRL, 0);
 
-		/* restore pin state we found before the firmware took over */
-		gpio1_map[0x13C / 4] = (gpio1_map[0x13C / 4] & ~swd_pin_mask)
-				| (saved_gpio_dataout & swd_pin_mask);
-		gpio1_map[0x34 / 4] = (gpio1_map[0x34 / 4] & ~swd_pin_mask)
-				| (saved_gpio_oe & swd_pin_mask);
+		/* restore pin state we found before the firmware took over
+		 * (only nRST is a GPIO1 pin on the rewired adapter) */
+		gpio1_map[0x13C / 4] = (gpio1_map[0x13C / 4] & ~nrst_pin_mask)
+				| (saved_gpio_dataout & nrst_pin_mask);
+		gpio1_map[0x34 / 4] = (gpio1_map[0x34 / 4] & ~nrst_pin_mask)
+				| (saved_gpio_oe & nrst_pin_mask);
 
 		munmap((void *)pruss_map, PRUSS0_MAP_SIZE);
 		munmap((void *)gpio1_map, 4096);
@@ -575,10 +588,10 @@ static const struct swd_driver pru_swd_swd = {
 
 static void pru_swd_execute_reset(struct jtag_command *cmd)
 {
-	/* srst wire on P8_15 (GPIO1_15), active low */
+	/* srst wire on P8_26 (GPIO1_29), active low */
 	uint32_t assert = cmd->cmd.reset->srst ? 1 : 0;
 
-	pru0_dram[MBOX_DATA] = 1u << 15;
+	pru0_dram[MBOX_DATA] = 1u << 29;
 	pru0_dram[MBOX_DATA + 1] = !assert;
 	pru_swd_exec(CMD_GPIO_OUT, 100);
 }
@@ -618,12 +631,18 @@ static int pru_swd_execute_queue(struct jtag_command *cmd_queue)
 
 static int pru_swd_speed(int speed)
 {
-	/* speed is in kHz (see pru_swd_khz); translate to delay iterations */
+	/* speed is in kHz (see pru_swd_khz); translate to delay iterations.
+	 * iters is kept >= 1: at n = 0 the register-only half_phase loop
+	 * would run ~8 MHz and outrun the SWDIO RC settle through the
+	 * series resistor (docs/06-timing.md). */
 	if (pru0_dram) {
 		uint32_t period_ns = 1000000u / (uint32_t)speed;
-		uint32_t iters = period_ns <= PRU_OCP_FLOOR_NS ? 0u
-			: (period_ns - PRU_PHASE_FIXED_NS) / PRU_DELAY_NS_PER_ITER;
+		uint32_t iters = (period_ns > PRU_LIO_FIXED_NS)
+			? (period_ns - PRU_LIO_FIXED_NS) / PRU_LIO_PER_ITER_NS
+			: 0;
 
+		if (iters < PRU_LIO_MIN_ITERS)
+			iters = PRU_LIO_MIN_ITERS;
 		pru0_dram[MBOX_DELAY] = iters;
 		LOG_INFO("pru-swd: SWCLK half-phase delay %u iterations (~%d kHz)",
 			iters, speed);
@@ -657,7 +676,7 @@ static int pru_swd_reset(int trst, int srst)
 	if (!pru0_dram)
 		return ERROR_OK;
 
-	pru0_dram[MBOX_DATA] = 1u << 15;
+	pru0_dram[MBOX_DATA] = 1u << 29;
 	pru0_dram[MBOX_DATA + 1] = !srst;	/* nRST is active low */
 	return pru_swd_exec(CMD_GPIO_OUT, 100);
 }
